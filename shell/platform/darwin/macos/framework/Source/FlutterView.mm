@@ -8,30 +8,22 @@
   __weak id<FlutterViewReshapeListener> _reshapeListener;
 }
 
-- (instancetype)initWithReshapeListener:(id<FlutterViewReshapeListener>)reshapeListener {
-  return [self initWithFrame:NSZeroRect reshapeListener:reshapeListener];
+- (instancetype)initWithShareContext:(NSOpenGLContext*)shareContext
+                     reshapeListener:(id<FlutterViewReshapeListener>)reshapeListener {
+  return [self initWithFrame:NSZeroRect shareContext:shareContext reshapeListener:reshapeListener];
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
+                 shareContext:(NSOpenGLContext*)shareContext
               reshapeListener:(id<FlutterViewReshapeListener>)reshapeListener {
-  NSOpenGLPixelFormatAttribute attributes[] = {
-      NSOpenGLPFAColorSize, 24, NSOpenGLPFAAlphaSize, 8, NSOpenGLPFADoubleBuffer, 0,
-  };
-  NSOpenGLPixelFormat* pixelFormat = [[NSOpenGLPixelFormat alloc] initWithAttributes:attributes];
-  self = [super initWithFrame:frame pixelFormat:pixelFormat];
+  self = [super initWithFrame:frame];
   if (self) {
+    self.openGLContext = [[NSOpenGLContext alloc] initWithFormat:shareContext.pixelFormat
+                                                    shareContext:shareContext];
     _reshapeListener = reshapeListener;
     self.wantsBestResolutionOpenGLSurface = YES;
   }
   return self;
-}
-
-- (void)makeCurrentContext {
-  [self.openGLContext makeCurrentContext];
-}
-
-- (void)onPresent {
-  [self.openGLContext flushBuffer];
 }
 
 #pragma mark - NSView overrides
@@ -54,6 +46,11 @@
 
 - (BOOL)acceptsFirstResponder {
   return YES;
+}
+
+- (void)viewDidChangeBackingProperties {
+  [super viewDidChangeBackingProperties];
+  [_reshapeListener viewDidReshape:self];
 }
 
 @end

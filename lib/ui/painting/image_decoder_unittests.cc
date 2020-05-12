@@ -6,20 +6,27 @@
 #include "flutter/fml/mapping.h"
 #include "flutter/fml/synchronization/waitable_event.h"
 #include "flutter/lib/ui/painting/image_decoder.h"
+#include "flutter/lib/ui/painting/image_decoder_test.h"
+#include "flutter/lib/ui/painting/multi_frame_codec.h"
+#include "flutter/runtime/dart_vm.h"
+#include "flutter/runtime/dart_vm_lifecycle.h"
+#include "flutter/testing/dart_isolate_runner.h"
+#include "flutter/testing/elf_loader.h"
+#include "flutter/testing/test_dart_native_resolver.h"
 #include "flutter/testing/test_gl_surface.h"
 #include "flutter/testing/testing.h"
 #include "flutter/testing/thread_test.h"
+#include "third_party/skia/include/codec/SkCodec.h"
 
 namespace flutter {
 namespace testing {
-
-using ImageDecoderFixtureTest = ThreadTest;
 
 class TestIOManager final : public IOManager {
  public:
   TestIOManager(fml::RefPtr<fml::TaskRunner> task_runner,
                 bool has_gpu_context = true)
-      : gl_context_(has_gpu_context ? gl_surface_.CreateContext() : nullptr),
+      : gl_surface_(SkISize::Make(1, 1)),
+        gl_context_(has_gpu_context ? gl_surface_.CreateGrContext() : nullptr),
         weak_gl_context_factory_(
             has_gpu_context ? std::make_unique<fml::WeakPtrFactory<GrContext>>(
                                   gl_context_.get())
@@ -28,7 +35,8 @@ class TestIOManager final : public IOManager {
             task_runner,
             fml::TimeDelta::FromNanoseconds(0))),
         runner_(task_runner),
-        weak_factory_(this) {
+        weak_factory_(this),
+        is_gpu_disabled_sync_switch_(std::make_shared<fml::SyncSwitch>()) {
     FML_CHECK(task_runner->RunsTasksOnCurrentThread())
         << "The IO manager must be initialized its primary task runner. The "
            "test harness may not be setup correctly/safely.";
@@ -61,6 +69,14 @@ class TestIOManager final : public IOManager {
     return unref_queue_;
   }
 
+  // |IOManager|
+  std::shared_ptr<fml::SyncSwitch> GetIsGpuDisabledSyncSwitch() override {
+    did_access_is_gpu_disabled_sync_switch_ = true;
+    return is_gpu_disabled_sync_switch_;
+  }
+
+  bool did_access_is_gpu_disabled_sync_switch_ = false;
+
  private:
   TestGLSurface gl_surface_;
   sk_sp<GrContext> gl_context_;
@@ -69,6 +85,7 @@ class TestIOManager final : public IOManager {
   fml::WeakPtr<TestIOManager> weak_prototype_;
   fml::RefPtr<fml::TaskRunner> runner_;
   fml::WeakPtrFactory<TestIOManager> weak_factory_;
+  std::shared_ptr<fml::SyncSwitch> is_gpu_disabled_sync_switch_;
 
   FML_DISALLOW_COPY_AND_ASSIGN(TestIOManager);
 };
@@ -91,18 +108,26 @@ static sk_sp<SkData> OpenFixtureAsSkData(const char* name) {
     delete reinterpret_cast<fml::FileMapping*>(context);
   };
 
-  return SkData::MakeWithProc(fixture_mapping->GetMapping(),
-                              fixture_mapping->GetSize(), on_release,
-                              fixture_mapping.release());
+  auto data = SkData::MakeWithProc(fixture_mapping->GetMapping(),
+                                   fixture_mapping->GetSize(), on_release,
+                                   fixture_mapping.get());
+
+  if (!data) {
+    return nullptr;
+  }
+  // The data is now owned by Skia.
+  fixture_mapping.release();
+  return data;
 }
 
 TEST_F(ImageDecoderFixtureTest, CanCreateImageDecoder) {
   auto loop = fml::ConcurrentMessageLoop::Create();
-  TaskRunners runners(GetCurrentTestName(),   // label
-                      GetThreadTaskRunner(),  // platform
-                      GetThreadTaskRunner(),  // gpu
-                      GetThreadTaskRunner(),  // ui
-                      GetThreadTaskRunner()   // io
+  auto thread_task_runner = CreateNewThread();
+  TaskRunners runners(GetCurrentTestName(),  // label
+                      thread_task_runner,    // platform
+                      thread_task_runner,    // raster
+                      thread_task_runner,    // ui
+                      thread_task_runner     // io
 
   );
 
@@ -118,15 +143,16 @@ TEST_F(ImageDecoderFixtureTest, CanCreateImageDecoder) {
 
 TEST_F(ImageDecoderFixtureTest, InvalidImageResultsError) {
   auto loop = fml::ConcurrentMessageLoop::Create();
-  TaskRunners runners(GetCurrentTestName(),   // label
-                      GetThreadTaskRunner(),  // platform
-                      GetThreadTaskRunner(),  // gpu
-                      GetThreadTaskRunner(),  // ui
-                      GetThreadTaskRunner()   // io
+  auto thread_task_runner = CreateNewThread();
+  TaskRunners runners(GetCurrentTestName(),  // label
+                      thread_task_runner,    // platform
+                      thread_task_runner,    // raster
+                      thread_task_runner,    // ui
+                      thread_task_runner     // io
   );
 
   fml::AutoResetWaitableEvent latch;
-  GetThreadTaskRunner()->PostTask([&]() {
+  thread_task_runner->PostTask([&]() {
     TestIOManager manager(runners.GetIOTaskRunner());
     ImageDecoder decoder(runners, loop->GetTaskRunner(),
                          manager.GetWeakIOManager());
@@ -148,21 +174,25 @@ TEST_F(ImageDecoderFixtureTest, InvalidImageResultsError) {
 
 TEST_F(ImageDecoderFixtureTest, ValidImageResultsInSuccess) {
   auto loop = fml::ConcurrentMessageLoop::Create();
-  TaskRunners runners(GetCurrentTestName(),    // label
-                      GetThreadTaskRunner(),   // platform
-                      CreateNewThread("gpu"),  // gpu
-                      CreateNewThread("ui"),   // ui
-                      CreateNewThread("io")    // io
+  TaskRunners runners(GetCurrentTestName(),         // label
+                      CreateNewThread("platform"),  // platform
+                      CreateNewThread("raster"),    // raster
+                      CreateNewThread("ui"),        // ui
+                      CreateNewThread("io")         // io
   );
 
   fml::AutoResetWaitableEvent latch;
 
-  std::unique_ptr<IOManager> io_manager;
-  std::unique_ptr<ImageDecoder> image_decoder;
+  std::unique_ptr<TestIOManager> io_manager;
 
+  auto release_io_manager = [&]() {
+    io_manager.reset();
+    latch.Signal();
+  };
   auto decode_image = [&]() {
-    image_decoder = std::make_unique<ImageDecoder>(
-        runners, loop->GetTaskRunner(), io_manager->GetWeakIOManager());
+    std::unique_ptr<ImageDecoder> image_decoder =
+        std::make_unique<ImageDecoder>(runners, loop->GetTaskRunner(),
+                                       io_manager->GetWeakIOManager());
 
     ImageDecoder::ImageDescriptor image_descriptor;
     image_descriptor.data = OpenFixtureAsSkData("DashInNooglerHat.jpg");
@@ -173,7 +203,57 @@ TEST_F(ImageDecoderFixtureTest, ValidImageResultsInSuccess) {
     ImageDecoder::ImageResult callback = [&](SkiaGPUObject<SkImage> image) {
       ASSERT_TRUE(runners.GetUITaskRunner()->RunsTasksOnCurrentThread());
       ASSERT_TRUE(image.get());
-      latch.Signal();
+      EXPECT_TRUE(io_manager->did_access_is_gpu_disabled_sync_switch_);
+      runners.GetIOTaskRunner()->PostTask(release_io_manager);
+    };
+    EXPECT_FALSE(io_manager->did_access_is_gpu_disabled_sync_switch_);
+    image_decoder->Decode(std::move(image_descriptor), callback);
+  };
+
+  auto setup_io_manager_and_decode = [&]() {
+    io_manager = std::make_unique<TestIOManager>(runners.GetIOTaskRunner());
+    runners.GetUITaskRunner()->PostTask(decode_image);
+  };
+
+  runners.GetIOTaskRunner()->PostTask(setup_io_manager_and_decode);
+  latch.Wait();
+}
+
+TEST_F(ImageDecoderFixtureTest, ExifDataIsRespectedOnDecode) {
+  auto loop = fml::ConcurrentMessageLoop::Create();
+  TaskRunners runners(GetCurrentTestName(),         // label
+                      CreateNewThread("platform"),  // platform
+                      CreateNewThread("raster"),    // raster
+                      CreateNewThread("ui"),        // ui
+                      CreateNewThread("io")         // io
+  );
+
+  fml::AutoResetWaitableEvent latch;
+
+  std::unique_ptr<IOManager> io_manager;
+
+  auto release_io_manager = [&]() {
+    io_manager.reset();
+    latch.Signal();
+  };
+
+  SkISize decoded_size = SkISize::MakeEmpty();
+  auto decode_image = [&]() {
+    std::unique_ptr<ImageDecoder> image_decoder =
+        std::make_unique<ImageDecoder>(runners, loop->GetTaskRunner(),
+                                       io_manager->GetWeakIOManager());
+
+    ImageDecoder::ImageDescriptor image_descriptor;
+    image_descriptor.data = OpenFixtureAsSkData("Horizontal.jpg");
+
+    ASSERT_TRUE(image_descriptor.data);
+    ASSERT_GE(image_descriptor.data->size(), 0u);
+
+    ImageDecoder::ImageResult callback = [&](SkiaGPUObject<SkImage> image) {
+      ASSERT_TRUE(runners.GetUITaskRunner()->RunsTasksOnCurrentThread());
+      ASSERT_TRUE(image.get());
+      decoded_size = image.get()->dimensions();
+      runners.GetIOTaskRunner()->PostTask(release_io_manager);
     };
     image_decoder->Decode(std::move(image_descriptor), callback);
   };
@@ -186,25 +266,33 @@ TEST_F(ImageDecoderFixtureTest, ValidImageResultsInSuccess) {
   runners.GetIOTaskRunner()->PostTask(setup_io_manager_and_decode);
 
   latch.Wait();
+
+  ASSERT_EQ(decoded_size.width(), 600);
+  ASSERT_EQ(decoded_size.height(), 200);
 }
 
 TEST_F(ImageDecoderFixtureTest, CanDecodeWithoutAGPUContext) {
   auto loop = fml::ConcurrentMessageLoop::Create();
-  TaskRunners runners(GetCurrentTestName(),    // label
-                      GetThreadTaskRunner(),   // platform
-                      CreateNewThread("gpu"),  // gpu
-                      CreateNewThread("ui"),   // ui
-                      CreateNewThread("io")    // io
+  TaskRunners runners(GetCurrentTestName(),         // label
+                      CreateNewThread("platform"),  // platform
+                      CreateNewThread("raster"),    // raster
+                      CreateNewThread("ui"),        // ui
+                      CreateNewThread("io")         // io
   );
 
   fml::AutoResetWaitableEvent latch;
 
   std::unique_ptr<IOManager> io_manager;
-  std::unique_ptr<ImageDecoder> image_decoder;
+
+  auto release_io_manager = [&]() {
+    io_manager.reset();
+    latch.Signal();
+  };
 
   auto decode_image = [&]() {
-    image_decoder = std::make_unique<ImageDecoder>(
-        runners, loop->GetTaskRunner(), io_manager->GetWeakIOManager());
+    std::unique_ptr<ImageDecoder> image_decoder =
+        std::make_unique<ImageDecoder>(runners, loop->GetTaskRunner(),
+                                       io_manager->GetWeakIOManager());
 
     ImageDecoder::ImageDescriptor image_descriptor;
     image_descriptor.data = OpenFixtureAsSkData("DashInNooglerHat.jpg");
@@ -215,7 +303,7 @@ TEST_F(ImageDecoderFixtureTest, CanDecodeWithoutAGPUContext) {
     ImageDecoder::ImageResult callback = [&](SkiaGPUObject<SkImage> image) {
       ASSERT_TRUE(runners.GetUITaskRunner()->RunsTasksOnCurrentThread());
       ASSERT_TRUE(image.get());
-      latch.Signal();
+      runners.GetIOTaskRunner()->PostTask(release_io_manager);
     };
     image_decoder->Decode(std::move(image_descriptor), callback);
   };
@@ -241,11 +329,11 @@ TEST_F(ImageDecoderFixtureTest, CanDecodeWithResizes) {
   ASSERT_NE(image_dimensions.width(), image_dimensions.height());
 
   auto loop = fml::ConcurrentMessageLoop::Create();
-  TaskRunners runners(GetCurrentTestName(),    // label
-                      GetThreadTaskRunner(),   // platform
-                      CreateNewThread("gpu"),  // gpu
-                      CreateNewThread("ui"),   // ui
-                      CreateNewThread("io")    // io
+  TaskRunners runners(GetCurrentTestName(),         // label
+                      CreateNewThread("platform"),  // platform
+                      CreateNewThread("raster"),    // raster
+                      CreateNewThread("ui"),        // ui
+                      CreateNewThread("io")         // io
   );
 
   fml::AutoResetWaitableEvent latch;
@@ -298,6 +386,20 @@ TEST_F(ImageDecoderFixtureTest, CanDecodeWithResizes) {
   ASSERT_EQ(decoded_size(100, {}), SkISize::Make(100, 133));
   ASSERT_EQ(decoded_size({}, 100), SkISize::Make(75, 100));
   ASSERT_EQ(decoded_size(100, 100), SkISize::Make(100, 100));
+
+  // Destroy the IO manager
+  runners.GetIOTaskRunner()->PostTask([&]() {
+    io_manager.reset();
+    latch.Signal();
+  });
+  latch.Wait();
+
+  // Destroy the image decoder
+  runners.GetUITaskRunner()->PostTask([&]() {
+    image_decoder.reset();
+    latch.Signal();
+  });
+  latch.Wait();
 }
 
 TEST_F(ImageDecoderFixtureTest, CanResizeWithoutDecode) {
@@ -326,11 +428,11 @@ TEST_F(ImageDecoderFixtureTest, CanResizeWithoutDecode) {
   ASSERT_NE(image_dimensions.width(), image_dimensions.height());
 
   auto loop = fml::ConcurrentMessageLoop::Create();
-  TaskRunners runners(GetCurrentTestName(),    // label
-                      GetThreadTaskRunner(),   // platform
-                      CreateNewThread("gpu"),  // gpu
-                      CreateNewThread("ui"),   // ui
-                      CreateNewThread("io")    // io
+  TaskRunners runners(GetCurrentTestName(),         // label
+                      CreateNewThread("platform"),  // platform
+                      CreateNewThread("raster"),    // raster
+                      CreateNewThread("ui"),        // ui
+                      CreateNewThread("io")         // io
   );
 
   fml::AutoResetWaitableEvent latch;
@@ -384,6 +486,171 @@ TEST_F(ImageDecoderFixtureTest, CanResizeWithoutDecode) {
   ASSERT_EQ(decoded_size(100, {}), SkISize::Make(100, 133));
   ASSERT_EQ(decoded_size({}, 100), SkISize::Make(75, 100));
   ASSERT_EQ(decoded_size(100, 100), SkISize::Make(100, 100));
+
+  // Destroy the IO manager
+  runners.GetIOTaskRunner()->PostTask([&]() {
+    io_manager.reset();
+    latch.Signal();
+  });
+  latch.Wait();
+
+  // Destroy the image decoder
+  runners.GetUITaskRunner()->PostTask([&]() {
+    image_decoder.reset();
+    latch.Signal();
+  });
+  latch.Wait();
+}
+
+// Verifies https://skia-review.googlesource.com/c/skia/+/259161 is present in
+// Flutter.
+TEST(ImageDecoderTest,
+     VerifyCodecRepeatCountsForGifAndWebPAreConsistentWithLoopCounts) {
+  auto gif_mapping = OpenFixtureAsSkData("hello_loop_2.gif");
+  auto webp_mapping = OpenFixtureAsSkData("hello_loop_2.webp");
+
+  ASSERT_TRUE(gif_mapping);
+  ASSERT_TRUE(webp_mapping);
+
+  auto gif_codec = SkCodec::MakeFromData(gif_mapping);
+  auto webp_codec = SkCodec::MakeFromData(webp_mapping);
+
+  ASSERT_TRUE(gif_codec);
+  ASSERT_TRUE(webp_codec);
+
+  // Both fixtures have a loop count of 2 which should lead to the repeat count
+  // of 1
+  ASSERT_EQ(gif_codec->getRepetitionCount(), 1);
+  ASSERT_EQ(webp_codec->getRepetitionCount(), 1);
+}
+
+TEST(ImageDecoderTest, VerifySimpleDecoding) {
+  auto data = OpenFixtureAsSkData("Horizontal.jpg");
+  auto image = SkImage::MakeFromEncoded(data);
+  ASSERT_TRUE(image != nullptr);
+  ASSERT_EQ(SkISize::Make(600, 200), image->dimensions());
+
+  ASSERT_EQ(ImageFromCompressedData(data, 6, 2, fml::tracing::TraceFlow(""))
+                ->dimensions(),
+            SkISize::Make(6, 2));
+}
+
+TEST(ImageDecoderTest, VerifySubpixelDecodingPreservesExifOrientation) {
+  auto data = OpenFixtureAsSkData("Horizontal.jpg");
+  auto image = SkImage::MakeFromEncoded(data);
+  ASSERT_TRUE(image != nullptr);
+  ASSERT_EQ(SkISize::Make(600, 200), image->dimensions());
+
+  auto decode = [data](std::optional<uint32_t> target_width,
+                       std::optional<uint32_t> target_height) {
+    return ImageFromCompressedData(data, target_width, target_height,
+                                   fml::tracing::TraceFlow(""));
+  };
+
+  auto expected_data = OpenFixtureAsSkData("Horizontal.png");
+  ASSERT_TRUE(expected_data != nullptr);
+  ASSERT_FALSE(expected_data->isEmpty());
+
+  auto assert_image = [&](auto decoded_image) {
+    ASSERT_EQ(decoded_image->dimensions(), SkISize::Make(300, 100));
+    ASSERT_TRUE(decoded_image->encodeToData(SkEncodedImageFormat::kPNG, 100)
+                    ->equals(expected_data.get()));
+  };
+
+  assert_image(decode(300, 100));
+  assert_image(decode(300, {}));
+  assert_image(decode({}, 100));
+}
+
+TEST_F(ImageDecoderFixtureTest,
+       MultiFrameCodecCanBeCollectedBeforeIOTasksFinish) {
+  // This test verifies that the MultiFrameCodec safely shares state between
+  // tasks on the IO and UI runners, and does not allow unsafe memory access if
+  // the UI object is collected while the IO thread still has pending decode
+  // work. This could happen in a real application if the engine is collected
+  // while a multi-frame image is decoding. To exercise this, the test:
+  //   - Starts a Dart VM
+  //   - Latches the IO task runner
+  //   - Create a MultiFrameCodec for an animated gif pointed to a callback
+  //     in the Dart fixture
+  //   - Calls getNextFrame on the UI task runner
+  //   - Collects the MultiFrameCodec object before unlatching the IO task
+  //     runner.
+  //   - Unlatches the IO task runner
+  auto settings = CreateSettingsForFixture();
+  auto vm_ref = DartVMRef::Create(settings);
+  auto vm_data = vm_ref.GetVMData();
+
+  auto gif_mapping = OpenFixtureAsSkData("hello_loop_2.gif");
+
+  ASSERT_TRUE(gif_mapping);
+
+  auto gif_codec = SkCodec::MakeFromData(gif_mapping);
+  ASSERT_TRUE(gif_codec);
+
+  TaskRunners runners(GetCurrentTestName(),         // label
+                      CreateNewThread("platform"),  // platform
+                      CreateNewThread("raster"),    // raster
+                      CreateNewThread("ui"),        // ui
+                      CreateNewThread("io")         // io
+  );
+
+  fml::AutoResetWaitableEvent latch;
+  fml::AutoResetWaitableEvent io_latch;
+  std::unique_ptr<TestIOManager> io_manager;
+
+  // Setup the IO manager.
+  runners.GetIOTaskRunner()->PostTask([&]() {
+    io_manager = std::make_unique<TestIOManager>(runners.GetIOTaskRunner());
+    latch.Signal();
+  });
+  latch.Wait();
+
+  auto isolate =
+      RunDartCodeInIsolate(vm_ref, settings, runners, "main", {},
+                           GetFixturesPath(), io_manager->GetWeakIOManager());
+
+  // Latch the IO task runner.
+  runners.GetIOTaskRunner()->PostTask([&]() { io_latch.Wait(); });
+
+  runners.GetUITaskRunner()->PostTask([&]() {
+    fml::AutoResetWaitableEvent isolate_latch;
+    fml::RefPtr<MultiFrameCodec> codec;
+    EXPECT_TRUE(isolate->RunInIsolateScope([&]() -> bool {
+      Dart_Handle library = Dart_RootLibrary();
+      if (Dart_IsError(library)) {
+        isolate_latch.Signal();
+        return false;
+      }
+      Dart_Handle closure =
+          Dart_GetField(library, Dart_NewStringFromCString("frameCallback"));
+      if (Dart_IsError(closure) || !Dart_IsClosure(closure)) {
+        isolate_latch.Signal();
+        return false;
+      }
+
+      codec = fml::MakeRefCounted<MultiFrameCodec>(std::move(gif_codec));
+      codec->getNextFrame(closure);
+      codec = nullptr;
+      isolate_latch.Signal();
+      return true;
+    }));
+    isolate_latch.Wait();
+
+    EXPECT_FALSE(codec);
+
+    io_latch.Signal();
+
+    latch.Signal();
+  });
+  latch.Wait();
+
+  // Destroy the IO manager
+  runners.GetIOTaskRunner()->PostTask([&]() {
+    io_manager.reset();
+    latch.Signal();
+  });
+  latch.Wait();
 }
 
 }  // namespace testing

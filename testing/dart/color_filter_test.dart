@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+// @dart = 2.6
 import 'dart:typed_data';
 import 'dart:ui';
 
@@ -41,10 +42,18 @@ void main() {
     return bytes.buffer.asUint32List();
   }
 
+  test('ColorFilter - nulls', () async {
+    final Paint paint = Paint()..colorFilter = const ColorFilter.mode(null, null);
+    expect(paint.colorFilter, null);
+
+    paint.colorFilter = const ColorFilter.matrix(null);
+    expect(paint.colorFilter, null);
+  });
+
   test('ColorFilter - mode', () async {
     final Paint paint = Paint()
       ..color = green
-      ..colorFilter = ColorFilter.mode(red, BlendMode.color);
+      ..colorFilter = const ColorFilter.mode(red, BlendMode.color);
 
     Uint32List bytes = await getBytesForPaint(paint);
     expect(bytes[0], greenRedColorBlend);
@@ -57,7 +66,7 @@ void main() {
   test('ColorFilter - matrix', () async {
     final Paint paint = Paint()
       ..color = green
-      ..colorFilter = ColorFilter.matrix(greyscaleColorMatrix);
+      ..colorFilter = const ColorFilter.matrix(greyscaleColorMatrix);
 
     Uint32List bytes = await getBytesForPaint(paint);
     expect(bytes[0], greenGreyscaled);
@@ -70,7 +79,7 @@ void main() {
   test('ColorFilter - linearToSrgbGamma', () async {
     final Paint paint = Paint()
       ..color = green
-      ..colorFilter = ColorFilter.linearToSrgbGamma();
+      ..colorFilter = const ColorFilter.linearToSrgbGamma();
 
     Uint32List bytes = await getBytesForPaint(paint);
     expect(bytes[0], greenLinearToSrgbGamma);
@@ -83,7 +92,7 @@ void main() {
   test('ColorFilter - srgbToLinearGamma', () async {
     final Paint paint = Paint()
       ..color = green
-      ..colorFilter = ColorFilter.srgbToLinearGamma();
+      ..colorFilter = const ColorFilter.srgbToLinearGamma();
 
     Uint32List bytes = await getBytesForPaint(paint);
     expect(bytes[0], greenSrgbToLinearGamma);

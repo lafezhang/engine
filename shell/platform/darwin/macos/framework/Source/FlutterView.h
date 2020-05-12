@@ -21,26 +21,18 @@
 @interface FlutterView : NSOpenGLView
 
 - (nullable instancetype)initWithFrame:(NSRect)frame
+                          shareContext:(nonnull NSOpenGLContext*)shareContext
                        reshapeListener:(nonnull id<FlutterViewReshapeListener>)reshapeListener
     NS_DESIGNATED_INITIALIZER;
 
-- (nullable instancetype)initWithReshapeListener:
-    (nonnull id<FlutterViewReshapeListener>)reshapeListener;
+- (nullable instancetype)initWithShareContext:(nonnull NSOpenGLContext*)shareContext
+                              reshapeListener:
+                                  (nonnull id<FlutterViewReshapeListener>)reshapeListener;
 
 - (nullable instancetype)initWithFrame:(NSRect)frameRect
                            pixelFormat:(nullable NSOpenGLPixelFormat*)format NS_UNAVAILABLE;
 - (nonnull instancetype)initWithFrame:(NSRect)frameRect NS_UNAVAILABLE;
 - (nullable instancetype)initWithCoder:(nonnull NSCoder*)coder NS_UNAVAILABLE;
 - (nonnull instancetype)init NS_UNAVAILABLE;
-
-/**
- * Sets this view as the current context object for OpenGL drawing.
- */
-- (void)makeCurrentContext;
-
-/**
- * Called when the OpenGL display should be updated.
- */
-- (void)onPresent;
 
 @end

@@ -7,6 +7,7 @@
 #include <android/native_window_jni.h>
 
 #include <utility>
+#include "unicode/uchar.h"
 
 #include "flutter/assets/directory_asset_bundle.h"
 #include "flutter/common/settings.h"
@@ -261,7 +262,11 @@ static void SetViewportMetrics(JNIEnv* env,
                                jint physicalViewInsetTop,
                                jint physicalViewInsetRight,
                                jint physicalViewInsetBottom,
-                               jint physicalViewInsetLeft) {
+                               jint physicalViewInsetLeft,
+                               jint systemGestureInsetTop,
+                               jint systemGestureInsetRight,
+                               jint systemGestureInsetBottom,
+                               jint systemGestureInsetLeft) {
   const flutter::ViewportMetrics metrics{
       static_cast<double>(devicePixelRatio),
       static_cast<double>(physicalWidth),
@@ -274,9 +279,13 @@ static void SetViewportMetrics(JNIEnv* env,
       static_cast<double>(physicalViewInsetRight),
       static_cast<double>(physicalViewInsetBottom),
       static_cast<double>(physicalViewInsetLeft),
+      static_cast<double>(systemGestureInsetTop),
+      static_cast<double>(systemGestureInsetRight),
+      static_cast<double>(systemGestureInsetBottom),
+      static_cast<double>(systemGestureInsetLeft),
   };
 
-  ANDROID_SHELL_HOLDER->SetViewportMetrics(metrics);
+  ANDROID_SHELL_HOLDER->GetPlatformView()->SetViewportMetrics(metrics);
 }
 
 static jobject GetBitmap(JNIEnv* env, jobject jcaller, jlong shell_holder) {
@@ -387,7 +396,8 @@ static void DispatchPointerDataPacket(JNIEnv* env,
                                       jint position) {
   uint8_t* data = static_cast<uint8_t*>(env->GetDirectBufferAddress(buffer));
   auto packet = std::make_unique<flutter::PointerDataPacket>(data, position);
-  ANDROID_SHELL_HOLDER->DispatchPointerDataPacket(std::move(packet));
+  ANDROID_SHELL_HOLDER->GetPlatformView()->DispatchPointerDataPacket(
+      std::move(packet));
 }
 
 static void DispatchSemanticsAction(JNIEnv* env,
@@ -475,9 +485,38 @@ static void InvokePlatformMessageEmptyResponseCallback(JNIEnv* env,
       );
 }
 
+static jboolean FlutterTextUtilsIsEmoji(JNIEnv* env,
+                                        jobject obj,
+                                        jint codePoint) {
+  return u_hasBinaryProperty(codePoint, UProperty::UCHAR_EMOJI);
+}
+
+static jboolean FlutterTextUtilsIsEmojiModifier(JNIEnv* env,
+                                                jobject obj,
+                                                jint codePoint) {
+  return u_hasBinaryProperty(codePoint, UProperty::UCHAR_EMOJI_MODIFIER);
+}
+
+static jboolean FlutterTextUtilsIsEmojiModifierBase(JNIEnv* env,
+                                                    jobject obj,
+                                                    jint codePoint) {
+  return u_hasBinaryProperty(codePoint, UProperty::UCHAR_EMOJI_MODIFIER_BASE);
+}
+
+static jboolean FlutterTextUtilsIsVariationSelector(JNIEnv* env,
+                                                    jobject obj,
+                                                    jint codePoint) {
+  return u_hasBinaryProperty(codePoint, UProperty::UCHAR_VARIATION_SELECTOR);
+}
+
+static jboolean FlutterTextUtilsIsRegionalIndicator(JNIEnv* env,
+                                                    jobject obj,
+                                                    jint codePoint) {
+  return u_hasBinaryProperty(codePoint, UProperty::UCHAR_REGIONAL_INDICATOR);
+}
 bool RegisterApi(JNIEnv* env) {
   static const JNINativeMethod flutter_jni_methods[] = {
-      // Start of methods from FlutterNativeView
+      // Start of methods from FlutterJNI
       {
           .name = "nativeAttach",
           .signature = "(Lio/flutter/embedding/engine/FlutterJNI;Z)J",
@@ -540,7 +579,7 @@ bool RegisterApi(JNIEnv* env) {
       },
       {
           .name = "nativeSetViewportMetrics",
-          .signature = "(JFIIIIIIIIII)V",
+          .signature = "(JFIIIIIIIIIIIIII)V",
           .fnPtr = reinterpret_cast<void*>(&SetViewportMetrics),
       },
       {
@@ -589,6 +628,36 @@ bool RegisterApi(JNIEnv* env) {
           .name = "nativeLookupCallbackInformation",
           .signature = "(J)Lio/flutter/view/FlutterCallbackInformation;",
           .fnPtr = reinterpret_cast<void*>(&LookupCallbackInformation),
+      },
+
+      // Start of methods for FlutterTextUtils
+      {
+          .name = "nativeFlutterTextUtilsIsEmoji",
+          .signature = "(I)Z",
+          .fnPtr = reinterpret_cast<void*>(&FlutterTextUtilsIsEmoji),
+      },
+      {
+          .name = "nativeFlutterTextUtilsIsEmojiModifier",
+          .signature = "(I)Z",
+          .fnPtr = reinterpret_cast<void*>(&FlutterTextUtilsIsEmojiModifier),
+      },
+      {
+          .name = "nativeFlutterTextUtilsIsEmojiModifierBase",
+          .signature = "(I)Z",
+          .fnPtr =
+              reinterpret_cast<void*>(&FlutterTextUtilsIsEmojiModifierBase),
+      },
+      {
+          .name = "nativeFlutterTextUtilsIsVariationSelector",
+          .signature = "(I)Z",
+          .fnPtr =
+              reinterpret_cast<void*>(&FlutterTextUtilsIsVariationSelector),
+      },
+      {
+          .name = "nativeFlutterTextUtilsIsRegionalIndicator",
+          .signature = "(I)Z",
+          .fnPtr =
+              reinterpret_cast<void*>(&FlutterTextUtilsIsRegionalIndicator),
       },
   };
 

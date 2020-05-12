@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+// @dart = 2.6
 part of dart.ui;
 
 /// Signature of callbacks that have no arguments and return no data.
@@ -39,6 +40,9 @@ typedef PlatformMessageResponseCallback = void Function(ByteData data);
 /// Signature for [Window.onPlatformMessage].
 typedef PlatformMessageCallback = void Function(String name, ByteData data, PlatformMessageResponseCallback callback);
 
+// Signature for _setNeedsReportTimings.
+typedef _SetNeedsReportTimingsFunc = void Function(bool value);
+
 /// Various important time points in the lifetime of a frame.
 ///
 /// [FrameTiming] records a timestamp of each phase for performance analysis.
@@ -53,12 +57,12 @@ enum FramePhase {
   /// See also [FrameTiming.buildDuration].
   buildFinish,
 
-  /// When the GPU thread starts rasterizing a frame.
+  /// When the raster thread starts rasterizing a frame.
   ///
   /// See also [FrameTiming.rasterDuration].
   rasterStart,
 
-  /// When the GPU thread finishes rasterizing a frame.
+  /// When the raster thread finishes rasterizing a frame.
   ///
   /// See also [FrameTiming.rasterDuration].
   rasterFinish,
@@ -66,7 +70,12 @@ enum FramePhase {
 
 /// Time-related performance metrics of a frame.
 ///
-/// See [Window.onReportTimings] for how to get this.
+/// If you're using the whole Flutter framework, please use
+/// [SchedulerBinding.addTimingsCallback] to get this. It's preferred over using
+/// [Window.onReportTimings] directly because
+/// [SchedulerBinding.addTimingsCallback] allows multiple callbacks. If
+/// [SchedulerBinding] is unavailable, then see [Window.onReportTimings] for how
+/// to get this.
 ///
 /// The metrics in debug mode (`flutter run` without any flags) may be very
 /// different from those in profile and release modes due to the debug overhead.
@@ -106,7 +115,7 @@ class FrameTiming {
   /// {@endtemplate}
   Duration get buildDuration => _rawDuration(FramePhase.buildFinish) - _rawDuration(FramePhase.buildStart);
 
-  /// The duration to rasterize the frame on the GPU thread.
+  /// The duration to rasterize the frame on the raster thread.
   ///
   /// {@macro dart.ui.FrameTiming.fps_smoothness_milliseconds}
   /// {@macro dart.ui.FrameTiming.fps_milliseconds}
@@ -168,18 +177,16 @@ enum AppLifecycleState {
   ///
   /// When the application is in this state, the engine will not call the
   /// [Window.onBeginFrame] and [Window.onDrawFrame] callbacks.
-  ///
-  /// Android apps in this state should assume that they may enter the
-  /// [suspending] state at any time.
   paused,
 
-  /// The application will be suspended momentarily.
+  /// The application is still hosted on a flutter engine but is detached from
+  /// any host views.
   ///
-  /// When the application is in this state, the engine will not call the
-  /// [Window.onBeginFrame] and [Window.onDrawFrame] callbacks.
-  ///
-  /// On iOS, this state is currently unused.
-  suspending,
+  /// When the application is in this state, the engine is running without
+  /// a view. It can either be in the progress of attaching a view when engine
+  /// was first initializes, or after the view being destroyed due to a Navigator
+  /// pop.
+  detached,
 }
 
 /// A representation of distances for each of the four edges of a rectangle,
@@ -466,48 +473,47 @@ class Locale {
   bool operator ==(dynamic other) {
     if (identical(this, other))
       return true;
-    if (other is! Locale)
-      return false;
-    final Locale typedOther = other;
-    return languageCode == typedOther.languageCode
-        && scriptCode == typedOther.scriptCode
-        && countryCode == typedOther.countryCode;
+    return other is Locale
+        && other.languageCode == languageCode
+        && other.scriptCode == scriptCode // scriptCode cannot be ''
+        && (other.countryCode == countryCode // Treat '' as equal to null.
+            || other.countryCode != null && other.countryCode.isEmpty && countryCode == null
+            || countryCode != null && countryCode.isEmpty && other.countryCode == null);
   }
 
   @override
-  int get hashCode => hashValues(languageCode, scriptCode, countryCode);
+  int get hashCode => hashValues(languageCode, scriptCode, countryCode == '' ? null : countryCode);
 
-  static Locale cachedLocale;
-  static String cachedLocaleString;
+  static Locale _cachedLocale;
+  static String _cachedLocaleString;
 
   /// Returns a string representing the locale.
   ///
   /// This identifier happens to be a valid Unicode Locale Identifier using
   /// underscores as separator, however it is intended to be used for debugging
   /// purposes only. For parseable results, use [toLanguageTag] instead.
+  @keepToString
   @override
-  String toString() => _toLanguageTag('_');
+  String toString() {
+    if (!identical(_cachedLocale, this)) {
+      _cachedLocale = this;
+      _cachedLocaleString = _rawToString('_');
+    }
+    return _cachedLocaleString;
+  }
 
   /// Returns a syntactically valid Unicode BCP47 Locale Identifier.
   ///
   /// Some examples of such identifiers: "en", "es-419", "hi-Deva-IN" and
   /// "zh-Hans-CN". See http://www.unicode.org/reports/tr35/ for technical
   /// details.
-  String toLanguageTag() => _toLanguageTag();
-
-  String _toLanguageTag([String separator = '-']) {
-    if (!identical(cachedLocale, this)) {
-      cachedLocale = this;
-      cachedLocaleString = _rawToString(separator);
-    }
-    return cachedLocaleString;
-  }
+  String toLanguageTag() => _rawToString('-');
 
   String _rawToString(String separator) {
     final StringBuffer out = StringBuffer(languageCode);
-    if (scriptCode != null)
+    if (scriptCode != null && scriptCode.isNotEmpty)
       out.write('$separator$scriptCode');
-    if (_countryCode != null)
+    if (_countryCode != null && _countryCode.isNotEmpty)
       out.write('$separator$countryCode');
     return out.toString();
   }
@@ -567,7 +573,9 @@ class Locale {
 /// [Window.viewPadding] anyway, so there is no need to account for that in the
 /// [Window.padding], which is always safe to use for such calculations.
 class Window {
-  Window._();
+  Window._() {
+    _setNeedsReportTimings = _nativeSetNeedsReportTimings;
+  }
 
   /// The number of device pixels for each logical pixel. This number might not
   /// be a power of two. Indeed, it might not even be an integer. For example,
@@ -615,12 +623,26 @@ class Window {
   Size get physicalSize => _physicalSize;
   Size _physicalSize = Size.zero;
 
+  /// The physical depth is the maximum elevation that the Window allows.
+  ///
+  /// Physical layers drawn at or above this elevation will have their elevation
+  /// clamped to this value. This can happen if the physical layer itself has
+  /// an elevation larger than available depth, or if some ancestor of the layer
+  /// causes it to have a cumulative elevation that is larger than the available
+  /// depth.
+  ///
+  /// The default value is [double.maxFinite], which is used for platforms that
+  /// do not specify a maximum elevation. This property is currently on expected
+  /// to be set to a non-default value on Fuchsia.
+  double get physicalDepth => _physicalDepth;
+  double _physicalDepth = double.maxFinite;
+
   /// The number of physical pixels on each side of the display rectangle into
   /// which the application can render, but over which the operating system
   /// will likely place system UI, such as the keyboard, that fully obscures
   /// any content.
   ///
-  /// When this changes, [onMetricsChanged] is called.
+  /// When this property changes, [onMetricsChanged] is called.
   ///
   /// The relationship between this [Window.viewInsets], [Window.viewPadding],
   /// and [Window.padding] are described in more detail in the documentation for
@@ -647,7 +669,7 @@ class Window {
   /// response to the soft keyboard being visible or hidden, whereas
   /// [Window.padding] will.
   ///
-  /// When this changes, [onMetricsChanged] is called.
+  /// When this property changes, [onMetricsChanged] is called.
   ///
   /// The relationship between this [Window.viewInsets], [Window.viewPadding],
   /// and [Window.padding] are described in more detail in the documentation for
@@ -662,6 +684,24 @@ class Window {
   ///    applications.
   WindowPadding get viewPadding => _viewPadding;
   WindowPadding _viewPadding = WindowPadding.zero;
+
+  /// The number of physical pixels on each side of the display rectangle into
+  /// which the application can render, but where the operating system will
+  /// consume input gestures for the sake of system navigation.
+  ///
+  /// For example, an operating system might use the vertical edges of the
+  /// screen, where swiping inwards from the edges takes users backward
+  /// through the history of screens they previously visited.
+  ///
+  /// When this property changes, [onMetricsChanged] is called.
+  ///
+  /// See also:
+  ///
+  ///  * [WidgetsBindingObserver], for a mechanism at the widgets layer to
+  ///    observe when this value changes.
+  ///  * [MediaQuery.of], a simpler mechanism for the same.
+  WindowPadding get systemGestureInsets => _systemGestureInsets;
+  WindowPadding _systemGestureInsets = WindowPadding.zero;
 
   /// The number of physical pixels on each side of the display rectangle into
   /// which the application can render, but which may be partially obscured by
@@ -694,9 +734,10 @@ class Window {
   WindowPadding _padding = WindowPadding.zero;
 
   /// A callback that is invoked whenever the [devicePixelRatio],
-  /// [physicalSize], [padding], or [viewInsets] values change, for example
-  /// when the device is rotated or when the application is resized (e.g. when
-  /// showing applications side-by-side on Android).
+  /// [physicalSize], [padding], [viewInsets], or [systemGestureInsets]
+  /// values change, for example when the device is rotated or when the
+  /// application is resized (e.g. when showing applications side-by-side
+  /// on Android).
   ///
   /// The engine invokes this callback in the same zone in which the callback
   /// was set.
@@ -750,6 +791,19 @@ class Window {
   ///    observe when this value changes.
   List<Locale> get locales => _locales;
   List<Locale> _locales;
+
+  /// The locale that the platform's native locale resolution system resolves to.
+  ///
+  /// This value may differ between platforms and is meant to allow Flutter's locale
+  /// resolution algorithms access to a locale that is consistent with other apps
+  /// on the device. Using this property is optional.
+  ///
+  /// This value may be used in a custom [localeListResolutionCallback] or used directly
+  /// in order to arrive at the most appropriate locale for the app.
+  ///
+  /// See [locales], which is the list of locales the user/device prefers.
+  Locale get platformResolvedLocale => _platformResolvedLocale;
+  Locale _platformResolvedLocale;
 
   /// A callback that is invoked whenever [locale] changes value.
   ///
@@ -897,6 +951,10 @@ class Window {
   /// A callback that is invoked to report the [FrameTiming] of recently
   /// rasterized frames.
   ///
+  /// It's prefered to use [SchedulerBinding.addTimingsCallback] than to use
+  /// [Window.onReportTimings] directly because
+  /// [SchedulerBinding.addTimingsCallback] allows multiple callbacks.
+  ///
   /// This can be used to see if the application has missed frames (through
   /// [FrameTiming.buildDuration] and [FrameTiming.rasterDuration]), or high
   /// latencies (through [FrameTiming.totalSpan]).
@@ -922,7 +980,8 @@ class Window {
     _onReportTimingsZone = Zone.current;
   }
 
-  void _setNeedsReportTimings(bool value) native 'Window_setNeedsReportTimings';
+  _SetNeedsReportTimingsFunc _setNeedsReportTimings;
+  void _nativeSetNeedsReportTimings(bool value) native 'Window_setNeedsReportTimings';
 
   /// A callback that is invoked when pointer data is available.
   ///
@@ -1055,10 +1114,10 @@ class Window {
   /// callback was set.
   VoidCallback get onAccessibilityFeaturesChanged => _onAccessibilityFeaturesChanged;
   VoidCallback _onAccessibilityFeaturesChanged;
-  Zone _onAccessibilityFlagsChangedZone;
+  Zone _onAccessibilityFeaturesChangedZone;
   set onAccessibilityFeaturesChanged(VoidCallback callback) {
     _onAccessibilityFeaturesChanged = callback;
-    _onAccessibilityFlagsChangedZone = Zone.current;
+    _onAccessibilityFeaturesChangedZone = Zone.current;
   }
 
   /// Change the retained semantics data about this window.
@@ -1139,6 +1198,18 @@ class Window {
       registrationZone.runUnaryGuarded(callback, data);
     };
   }
+
+
+  /// The embedder can specify data that the isolate can request synchronously
+  /// on launch. This accessor fetches that data.
+  ///
+  /// This data is persistent for the duration of the Flutter application and is
+  /// available even after isolate restarts. Because of this lifecycle, the size
+  /// of this data must be kept to a minimum.
+  ///
+  /// For asynchronous communication between the embedder and isolate, a
+  /// platform channel may be used.
+  ByteData getPersistentIsolateData() native 'Window_getPersistentIsolateData';
 }
 
 /// Additional accessibility features that may be enabled by the platform.
@@ -1157,6 +1228,7 @@ class AccessibilityFeatures {
   static const int _kDisableAnimationsIndex = 1 << 2;
   static const int _kBoldTextIndex = 1 << 3;
   static const int _kReduceMotionIndex = 1 << 4;
+  static const int _kHighContrastIndex = 1 << 5;
 
   // A bitfield which represents each enabled feature.
   final int _index;
@@ -1184,6 +1256,11 @@ class AccessibilityFeatures {
   /// Only supported on iOS.
   bool get reduceMotion => _kReduceMotionIndex & _index != 0;
 
+  /// The platform is requesting that UI be rendered with darker colors.
+  ///
+  /// Only supported on iOS.
+  bool get highContrast => _kHighContrastIndex & _index != 0;
+
   @override
   String toString() {
     final List<String> features = <String>[];
@@ -1197,6 +1274,8 @@ class AccessibilityFeatures {
       features.add('boldText');
     if (reduceMotion)
       features.add('reduceMotion');
+    if (highContrast)
+      features.add('highContrast');
     return 'AccessibilityFeatures$features';
   }
 
@@ -1204,8 +1283,8 @@ class AccessibilityFeatures {
   bool operator ==(dynamic other) {
     if (other.runtimeType != runtimeType)
       return false;
-    final AccessibilityFeatures typedOther = other;
-    return _index == typedOther._index;
+    return other is AccessibilityFeatures
+        && other._index == _index;
   }
 
   @override
